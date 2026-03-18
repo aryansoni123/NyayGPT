@@ -42,3 +42,5 @@ class HealthResponse(BaseModel):
     service: str
     openai_key_configured: bool
     indexed_chunks: int
+    ingestion_mode: str
+    data_directory: str

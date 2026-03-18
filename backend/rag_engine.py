@@ -1,4 +1,5 @@
 import json
+import hashlib
 import re
 import sqlite3
 import uuid
@@ -30,6 +31,12 @@ class HybridRAGEngine:
         self.embedding_model = embedding_model
         self.llm_model = llm_model
         self.chunk_count = 0
+        self.last_sync_summary: dict[str, int | str] = {
+            "scanned": 0,
+            "ingested": 0,
+            "skipped": 0,
+            "updated": 0,
+        }
 
         self.embeddings = OpenAIEmbeddings(model=self.embedding_model)
         self.vectorstore: FAISS | None = None
@@ -85,12 +92,101 @@ class HybridRAGEngine:
             for row in rows
         ]
 
+    def _delete_document_by_filename(self, filename: str) -> None:
+        self.db_conn.execute("DELETE FROM documents WHERE filename = ?", (filename,))
+        self.db_conn.commit()
+
+    def _compute_checksum(self, file_bytes: bytes) -> str:
+        return hashlib.sha256(file_bytes).hexdigest()
+
+    def ingest_data_directory(self, data_dir: Path) -> dict[str, int | str]:
+        if not data_dir.exists():
+            self.rebuild_retrievers_from_sqlite()
+            self.last_sync_summary = {
+                "scanned": 0,
+                "ingested": 0,
+                "skipped": 0,
+                "updated": 0,
+                "status": f"missing-data-directory:{data_dir}",
+            }
+            return self.last_sync_summary
+
+        pdf_paths = sorted(data_dir.rglob("*.pdf"))
+        existing_rows = self.db_conn.execute(
+            "SELECT filename, checksum FROM documents"
+        ).fetchall()
+        existing_checksums = {row["filename"]: row["checksum"] for row in existing_rows}
+
+        scanned = 0
+        ingested = 0
+        skipped = 0
+        updated = 0
+
+        for pdf_path in pdf_paths:
+            scanned += 1
+            file_bytes = pdf_path.read_bytes()
+            checksum = self._compute_checksum(file_bytes)
+            filename = str(pdf_path.relative_to(data_dir)).replace("\\", "/")
+            prior_checksum = existing_checksums.get(filename)
+
+            if prior_checksum == checksum:
+                skipped += 1
+                continue
+
+            if prior_checksum is not None and prior_checksum != checksum:
+                self._delete_document_by_filename(filename)
+                updated += 1
+
+            self._ingest_pdf_internal(
+                filename=filename,
+                file_bytes=file_bytes,
+                content_type="application/pdf",
+                checksum=checksum,
+                save_local_copy=False,
+                rebuild=False,
+            )
+            ingested += 1
+
+        self.rebuild_retrievers_from_sqlite()
+        self.last_sync_summary = {
+            "scanned": scanned,
+            "ingested": ingested,
+            "skipped": skipped,
+            "updated": updated,
+            "status": "ok",
+        }
+        return self.last_sync_summary
+
     def ingest_pdf(self, filename: str, file_bytes: bytes, content_type: str = "application/pdf") -> dict:
+        return self._ingest_pdf_internal(
+            filename=filename,
+            file_bytes=file_bytes,
+            content_type=content_type,
+            checksum=self._compute_checksum(file_bytes),
+            save_local_copy=True,
+            rebuild=True,
+        )
+
+    def _ingest_pdf_internal(
+        self,
+        filename: str,
+        file_bytes: bytes,
+        content_type: str,
+        checksum: str,
+        save_local_copy: bool,
+        rebuild: bool,
+    ) -> dict:
         document_id = str(uuid.uuid4())
-        saved_path = self.upload_dir / f"{document_id}_{filename}"
-        saved_path.write_bytes(file_bytes)
+        if save_local_copy:
+            saved_path = self.upload_dir / f"{document_id}_{Path(filename).name}"
+            saved_path.write_bytes(file_bytes)
+        else:
+            saved_path = self.upload_dir / f"{document_id}_tmp_read.pdf"
+            saved_path.write_bytes(file_bytes)
 
         reader = PdfReader(str(saved_path))
+        if not save_local_copy and saved_path.exists():
+            saved_path.unlink(missing_ok=True)
         if not reader.pages:
             raise ValueError("No readable pages found in PDF.")
 
@@ -103,10 +199,18 @@ class HybridRAGEngine:
         uploaded_at = datetime.now(timezone.utc).isoformat()
         self.db_conn.execute(
             """
-            INSERT INTO documents (id, filename, content_type, file_data, uploaded_at, page_count)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO documents (id, filename, checksum, content_type, file_data, uploaded_at, page_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (document_id, filename, content_type, sqlite3.Binary(file_bytes), uploaded_at, len(reader.pages)),
+            (
+                document_id,
+                filename,
+                checksum,
+                content_type,
+                sqlite3.Binary(file_bytes),
+                uploaded_at,
+                len(reader.pages),
+            ),
         )
 
         all_chunks: list[Document] = []
@@ -151,12 +255,14 @@ class HybridRAGEngine:
 
                 all_chunks.append(Document(page_content=chunk_doc.page_content, metadata=metadata))
 
-        self.db_conn.commit()
-
         if not all_chunks:
+            self.db_conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+            self.db_conn.commit()
             raise ValueError("No extractable text found in uploaded PDF.")
 
-        self.rebuild_retrievers_from_sqlite()
+        self.db_conn.commit()
+        if rebuild:
+            self.rebuild_retrievers_from_sqlite()
 
         return {
             "status": "success",

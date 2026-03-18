@@ -16,6 +16,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
             filename TEXT NOT NULL,
+            checksum TEXT,
             content_type TEXT,
             file_data BLOB NOT NULL,
             uploaded_at TEXT NOT NULL,
@@ -46,4 +47,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chunks_page_index ON chunks(page_index);
         """
     )
+
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()]
+    if "checksum" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN checksum TEXT;")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_filename ON documents(filename);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_checksum ON documents(checksum);")
     conn.commit()

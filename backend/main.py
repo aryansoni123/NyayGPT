@@ -4,18 +4,19 @@ from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from db import ensure_schema, init_db
 from rag_engine import HybridRAGEngine
-from schemas import ChatRequest, ChatResponse, DocumentItem, HealthResponse, UploadResponse
+from schemas import ChatRequest, ChatResponse, DocumentItem, HealthResponse
 
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+SOURCE_DATA_DIR = BASE_DIR.parent / "Data"
 UPLOAD_DIR = BASE_DIR / "uploads"
 VECTOR_DIR = BASE_DIR / "vectorstore" / "db_faiss"
 SQLITE_PATH = DATA_DIR / "nyaygpt.sqlite3"
@@ -37,7 +38,7 @@ rag_engine = HybridRAGEngine(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    rag_engine.rebuild_retrievers_from_sqlite()
+    rag_engine.ingest_data_directory(SOURCE_DATA_DIR)
     yield
 
 
@@ -64,6 +65,8 @@ async def health() -> HealthResponse:
         service="NyayGPT FastAPI RAG",
         openai_key_configured=bool(os.getenv("OPENAI_API_KEY")),
         indexed_chunks=rag_engine.chunk_count,
+        ingestion_mode="startup_data_directory",
+        data_directory=str(SOURCE_DATA_DIR),
     )
 
 
@@ -72,29 +75,12 @@ async def list_documents() -> list[DocumentItem]:
     return rag_engine.list_documents()
 
 
-@app.post("/documents/upload", response_model=UploadResponse)
-async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing file name.")
-
-    content_type = (file.content_type or "").lower()
-    is_pdf_name = file.filename.lower().endswith(".pdf")
-    is_pdf_type = "pdf" in content_type
-    if not is_pdf_name and not is_pdf_type:
-        raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
-
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    try:
-        result = rag_engine.ingest_pdf(file.filename, file_bytes, content_type=content_type)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
-
-    return UploadResponse(**result)
+@app.post("/documents/upload")
+async def upload_document_disabled() -> dict:
+    return {
+        "status": "disabled",
+        "message": "Upload is disabled. Put PDF files in the workspace Data directory and restart backend.",
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
